@@ -395,6 +395,183 @@ app.patch(
   },
 );
 
+// Reads "2026-12-14" as a date at midnight UTC, or null if it isn't a real date
+const parseEventDate = (value) => {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return null;
+  }
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+app.post('/bookings', verifyToken, verifyRole('customer'), async (req, res) => {
+  const { serviceId, eventLocation, message } = req.body;
+  const eventDate = parseEventDate(req.body.eventDate);
+
+  if (!ObjectId.isValid(serviceId)) {
+    return res.status(404).send({ message: 'Service not found' });
+  }
+  if (!eventDate) {
+    return res.status(400).send({ message: 'Please choose a valid event date' });
+  }
+
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  if (eventDate < today) {
+    return res.status(400).send({ message: 'The event date can not be in the past' });
+  }
+  if (!eventLocation?.trim()) {
+    return res.status(400).send({ message: 'Please add the event location' });
+  }
+  if (message && message.length > 500) {
+    return res.status(400).send({ message: 'The message can be up to 500 characters' });
+  }
+
+  const [service] = await servicesCollection
+    .aggregate([{ $match: { _id: new ObjectId(serviceId) } }, ...withVendor])
+    .toArray();
+  if (!service) {
+    return res.status(404).send({ message: 'Service not found' });
+  }
+  if (service.status !== 'approved' || !service.isActive || service.vendor.isBlocked) {
+    return res.status(400).send({ message: 'This service is not available for booking' });
+  }
+  if (service.vendorId.toString() === req.user.id) {
+    return res.status(403).send({ message: 'You can not book your own service' });
+  }
+
+  // One active request per service and date for each customer
+  const duplicate = await bookingsCollection.findOne({
+    serviceId: service._id,
+    customerId: new ObjectId(req.user.id),
+    eventDate,
+    status: { $in: ['pending', 'accepted'] },
+  });
+  if (duplicate) {
+    return res.status(409).send({
+      message: 'You already have a request for this service on that date',
+    });
+  }
+
+  const result = await bookingsCollection.insertOne({
+    serviceId: service._id,
+    vendorId: service.vendorId,
+    customerId: new ObjectId(req.user.id),
+    eventDate,
+    eventLocation: eventLocation.trim(),
+    message: message?.trim() || '',
+    status: 'pending',
+    createdAt: new Date(),
+  });
+
+  res.status(201).send({ message: 'Booking request sent', id: result.insertedId });
+});
+
+// Adds the service name and photo, plus the vendor or the customer, to each booking
+const bookingDetails = (person) => [
+  {
+    $lookup: {
+      from: 'services',
+      localField: 'serviceId',
+      foreignField: '_id',
+      pipeline: [{ $project: { serviceName: 1, category: 1, images: 1 } }],
+      as: 'service',
+    },
+  },
+  { $unwind: { path: '$service', preserveNullAndEmptyArrays: true } },
+  {
+    $lookup: {
+      from: 'user',
+      localField: person === 'vendor' ? 'vendorId' : 'customerId',
+      foreignField: '_id',
+      pipeline: [{ $project: { name: 1, email: 1, image: 1, businessName: 1 } }],
+      as: person,
+    },
+  },
+  { $unwind: { path: `$${person}`, preserveNullAndEmptyArrays: true } },
+  { $sort: { createdAt: -1 } },
+];
+
+// Booking requests the logged in customer has sent
+app.get('/bookings/my', verifyToken, verifyRole('customer'), async (req, res) => {
+  const bookings = await bookingsCollection
+    .aggregate([
+      { $match: { customerId: new ObjectId(req.user.id) } },
+      ...bookingDetails('vendor'),
+    ])
+    .toArray();
+
+  res.send(bookings);
+});
+
+app.patch('/bookings/:id/cancel', verifyToken, verifyRole('customer'), async (req, res) => {
+  const { id } = req.params;
+  if (!ObjectId.isValid(id)) {
+    return res.status(404).send({ message: 'Booking not found' });
+  }
+
+  const booking = await bookingsCollection.findOne({ _id: new ObjectId(id) });
+  if (!booking) {
+    return res.status(404).send({ message: 'Booking not found' });
+  }
+  if (booking.customerId.toString() !== req.user.id) {
+    return res.status(403).send({ message: 'You can only cancel your own bookings' });
+  }
+
+  // Only changes the booking if it is still pending, even if two requests arrive at once
+  const result = await bookingsCollection.updateOne(
+    { _id: booking._id, status: 'pending' },
+    { $set: { status: 'cancelled' } },
+  );
+  if (result.modifiedCount === 0) {
+    return res.status(400).send({ message: 'Only pending requests can be cancelled' });
+  }
+
+  res.send({ message: 'Booking request cancelled' });
+});
+
+// Booking requests for the logged in vendor's services
+app.get('/vendor/bookings', verifyToken, verifyRole('vendor'), async (req, res) => {
+  const bookings = await bookingsCollection
+    .aggregate([
+      { $match: { vendorId: new ObjectId(req.user.id) } },
+      ...bookingDetails('customer'),
+    ])
+    .toArray();
+
+  res.send(bookings);
+});
+
+app.patch('/vendor/bookings/:id', verifyToken, verifyRole('vendor'), async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+
+  if (!ObjectId.isValid(id)) {
+    return res.status(404).send({ message: 'Booking not found' });
+  }
+  if (!['accepted', 'rejected'].includes(status)) {
+    return res.status(400).send({ message: 'Status must be accepted or rejected' });
+  }
+
+  const booking = await bookingsCollection.findOne({ _id: new ObjectId(id) });
+  if (!booking) {
+    return res.status(404).send({ message: 'Booking not found' });
+  }
+  if (booking.vendorId.toString() !== req.user.id) {
+    return res.status(403).send({ message: 'You can only manage your own booking requests' });
+  }
+
+  const result = await bookingsCollection.updateOne(
+    { _id: booking._id, status: 'pending' },
+    { $set: { status } },
+  );
+  if (result.modifiedCount === 0) {
+    return res.status(400).send({ message: 'This request has already been handled' });
+  }
+
+  res.send({ message: `Booking request ${status}` });
+});
+
 // The logged in user, as the server sees them
 app.get('/users/me', verifyToken, (req, res) => {
   res.send(req.user);
