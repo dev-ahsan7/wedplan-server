@@ -3,13 +3,17 @@ import cors from 'cors';
 import 'dotenv/config';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { MongoClient, ObjectId } from 'mongodb';
+import Stripe from 'stripe';
 
 const app = express();
 const PORT = process.env.PORT || 8100;
 const CLIENT_URL = process.env.CLIENT_URL;
 
-app.use(cors({ origin: CLIENT_URL }));
-app.use(express.json());
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// Premium plan: $9.99 per month
+const PREMIUM_PRICE = 999;
+const PREMIUM_CURRENCY = 'usd';
 
 const client = new MongoClient(process.env.MONGODB_URI);
 const db = client.db('wedPlan');
@@ -19,6 +23,82 @@ const usersCollection = db.collection('user');
 const servicesCollection = db.collection('services');
 const bookingsCollection = db.collection('bookings');
 const transactionsCollection = db.collection('transactions');
+
+app.use(cors({ origin: CLIENT_URL }));
+
+// Stripe webhook. It needs the raw body to check Stripe's signature,
+// so it is added before express.json(). Premium is only turned on here.
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers['stripe-signature'],
+      process.env.STRIPE_WEBHOOK_SECRET,
+    );
+  } catch {
+    return res.status(400).send({ message: 'Invalid Stripe signature' });
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    if (session.payment_status === 'paid' && session.mode === 'subscription') {
+      const subscription = await stripe.subscriptions.retrieve(session.subscription);
+      const periodEnd = subscription.items.data[0].current_period_end;
+
+      await transactionsCollection.updateOne(
+        { stripeSessionId: session.id },
+        { $set: { status: 'paid', stripeSubscriptionId: subscription.id } },
+      );
+      await usersCollection.updateOne(
+        { _id: new ObjectId(session.metadata.vendorId) },
+        {
+          $set: {
+            subscriptionPlan: 'premium',
+            subscriptionExpiresAt: new Date(periodEnd * 1000),
+          },
+        },
+      );
+    }
+  }
+
+  // The vendor left the Stripe page without paying
+  if (event.type === 'checkout.session.expired') {
+    await transactionsCollection.updateOne(
+      { stripeSessionId: event.data.object.id, status: 'pending' },
+      { $set: { status: 'cancelled' } },
+    );
+  }
+
+  // Monthly renewal: move the end date forward
+  if (event.type === 'customer.subscription.updated') {
+    const subscription = event.data.object;
+    if (subscription.status === 'active') {
+      await usersCollection.updateOne(
+        { _id: new ObjectId(subscription.metadata.vendorId) },
+        {
+          $set: {
+            subscriptionPlan: 'premium',
+            subscriptionExpiresAt: new Date(subscription.items.data[0].current_period_end * 1000),
+          },
+        },
+      );
+    }
+  }
+
+  // Subscription cancelled or payments stopped: back to the free plan
+  if (event.type === 'customer.subscription.deleted') {
+    const subscription = event.data.object;
+    await usersCollection.updateOne(
+      { _id: new ObjectId(subscription.metadata.vendorId) },
+      { $set: { subscriptionPlan: 'free' }, $unset: { subscriptionExpiresAt: '' } },
+    );
+  }
+
+  res.send({ received: true });
+});
+
+app.use(express.json());
 
 // Public keys from the client's Better Auth, used to check tokens
 const JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`));
@@ -54,6 +134,11 @@ const verifyToken = async (req, res, next) => {
     return res.status(403).send({ message: 'Your account has been blocked' });
   }
 
+  // Premium that has run out counts as the free plan
+  const isPremium =
+    user.subscriptionPlan === 'premium' &&
+    (!user.subscriptionExpiresAt || user.subscriptionExpiresAt > new Date());
+
   req.user = {
     id: user._id.toString(),
     name: user.name,
@@ -61,7 +146,8 @@ const verifyToken = async (req, res, next) => {
     image: user.image,
     role: user.role,
     businessName: user.businessName,
-    subscriptionPlan: user.subscriptionPlan || 'free',
+    subscriptionPlan: isPremium ? 'premium' : 'free',
+    subscriptionExpiresAt: user.subscriptionExpiresAt,
   };
   next();
 };
@@ -677,6 +763,66 @@ app.get('/admin/transactions', verifyToken, verifyRole('admin'), async (req, res
     .toArray();
 
   res.send(transactions);
+});
+
+// Vendor starts a Premium subscription. The vendor comes from the token,
+// so nobody can start a subscription for another vendor.
+app.post('/subscriptions/checkout', verifyToken, verifyRole('vendor'), async (req, res) => {
+  if (req.user.subscriptionPlan === 'premium') {
+    return res.status(400).send({ message: 'You are already on the Premium plan' });
+  }
+
+  const session = await stripe.checkout.sessions.create({
+    mode: 'subscription',
+    customer_email: req.user.email,
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: PREMIUM_CURRENCY,
+          unit_amount: PREMIUM_PRICE,
+          recurring: { interval: 'month' },
+          product_data: { name: 'WedPlan Premium' },
+        },
+      },
+    ],
+    metadata: { vendorId: req.user.id },
+    subscription_data: { metadata: { vendorId: req.user.id } },
+    success_url: `${CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${CLIENT_URL}/payment/cancel`,
+  });
+
+  // Saved as pending. Only the webhook can mark it as paid.
+  await transactionsCollection.insertOne({
+    vendorId: new ObjectId(req.user.id),
+    plan: 'premium',
+    amount: PREMIUM_PRICE / 100,
+    currency: PREMIUM_CURRENCY,
+    stripeSessionId: session.id,
+    status: 'pending',
+    createdAt: new Date(),
+  });
+
+  res.send({ url: session.url });
+});
+
+// The Payment Success page asks this until the webhook has confirmed the payment
+app.get('/subscriptions/session/:sessionId', verifyToken, verifyRole('vendor'), async (req, res) => {
+  const transaction = await transactionsCollection.findOne({
+    stripeSessionId: req.params.sessionId,
+    vendorId: new ObjectId(req.user.id),
+  });
+  if (!transaction) {
+    return res.status(404).send({ message: 'Payment not found' });
+  }
+
+  res.send({
+    status: transaction.status,
+    amount: transaction.amount,
+    currency: transaction.currency,
+    plan: req.user.subscriptionPlan,
+    subscriptionExpiresAt: req.user.subscriptionExpiresAt,
+  });
 });
 
 // The logged in user, as the server sees them
