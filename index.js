@@ -572,6 +572,113 @@ app.patch('/vendor/bookings/:id', verifyToken, verifyRole('vendor'), async (req,
   res.send({ message: `Booking request ${status}` });
 });
 
+// Admin: every user, with search by name or email and a role filter
+app.get('/admin/users', verifyToken, verifyRole('admin'), async (req, res) => {
+  const { search, role } = req.query;
+  const query = {};
+
+  if (search?.trim()) {
+    const text = new RegExp(escapeRegex(search.trim()), 'i');
+    query.$or = [{ name: text }, { email: text }];
+  }
+  if (['admin', 'vendor', 'customer'].includes(role)) {
+    query.role = role;
+  }
+
+  const users = await usersCollection
+    .find(query, {
+      projection: {
+        name: 1,
+        email: 1,
+        image: 1,
+        role: 1,
+        businessName: 1,
+        isBlocked: 1,
+        subscriptionPlan: 1,
+        createdAt: 1,
+      },
+    })
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  res.send(users);
+});
+
+// Admin: one user plus a few numbers about them
+app.get('/admin/users/:id', verifyToken, verifyRole('admin'), async (req, res) => {
+  const { id } = req.params;
+  if (!ObjectId.isValid(id)) {
+    return res.status(404).send({ message: 'User not found' });
+  }
+
+  const userId = new ObjectId(id);
+  const user = await usersCollection.findOne(
+    { _id: userId },
+    { projection: { emailVerified: 0, updatedAt: 0, isDemo: 0 } },
+  );
+  if (!user) {
+    return res.status(404).send({ message: 'User not found' });
+  }
+
+  const [services, bookingsSent, bookingsReceived] = await Promise.all([
+    servicesCollection.countDocuments({ vendorId: userId }),
+    bookingsCollection.countDocuments({ customerId: userId }),
+    bookingsCollection.countDocuments({ vendorId: userId }),
+  ]);
+
+  res.send({ ...user, stats: { services, bookingsSent, bookingsReceived } });
+});
+
+app.patch('/admin/users/:id/block', verifyToken, verifyRole('admin'), async (req, res) => {
+  const { id } = req.params;
+  const isBlocked = req.body.isBlocked === true;
+
+  if (!ObjectId.isValid(id)) {
+    return res.status(404).send({ message: 'User not found' });
+  }
+  if (id === req.user.id) {
+    return res.status(400).send({ message: 'You can not block your own account' });
+  }
+
+  const user = await usersCollection.findOne({ _id: new ObjectId(id) });
+  if (!user) {
+    return res.status(404).send({ message: 'User not found' });
+  }
+  if (user.role === 'admin') {
+    return res.status(400).send({ message: 'Admins can not be blocked' });
+  }
+
+  await usersCollection.updateOne({ _id: user._id }, { $set: { isBlocked } });
+
+  // Signs a blocked user out everywhere by removing their sessions
+  if (isBlocked) {
+    await db.collection('session').deleteMany({ userId: { $in: [user._id, id] } });
+  }
+
+  res.send({ message: isBlocked ? `${user.name} is blocked` : `${user.name} is unblocked` });
+});
+
+// Admin: subscription payments. Read only, so nobody can mark a failed payment as paid.
+app.get('/admin/transactions', verifyToken, verifyRole('admin'), async (req, res) => {
+  const transactions = await transactionsCollection
+    .aggregate([
+      {
+        $lookup: {
+          from: 'user',
+          localField: 'vendorId',
+          foreignField: '_id',
+          pipeline: [{ $project: { name: 1, email: 1, image: 1, businessName: 1 } }],
+          as: 'vendor',
+        },
+      },
+      { $unwind: { path: '$vendor', preserveNullAndEmptyArrays: true } },
+      { $sort: { createdAt: -1 } },
+    ])
+    .toArray();
+
+  res.send(transactions);
+});
+
 // The logged in user, as the server sees them
 app.get('/users/me', verifyToken, (req, res) => {
   res.send(req.user);
