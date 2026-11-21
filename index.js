@@ -188,14 +188,21 @@ const getServiceFields = (body) => {
     ? body.images.filter((url) => typeof url === 'string' && url.startsWith('https://'))
     : [];
 
-  if (!serviceName?.trim() || !description?.trim() || !location?.trim()) {
+  const isText = (value) => typeof value === 'string' && value.trim() !== '';
+  if (!isText(serviceName) || !isText(description) || !isText(location)) {
     return { error: 'Please fill in all the fields' };
+  }
+  if (serviceName.length > 100 || location.length > 100) {
+    return { error: 'Name and location can be up to 100 characters' };
+  }
+  if (description.length > 2000) {
+    return { error: 'The description can be up to 2000 characters' };
   }
   if (!CATEGORIES.includes(category)) {
     return { error: 'Please choose a valid category' };
   }
-  if (!Number.isFinite(price) || price <= 0) {
-    return { error: 'Price must be more than 0' };
+  if (!Number.isFinite(price) || price <= 0 || price > 10000000) {
+    return { error: 'Price must be between 1 and 10,000,000' };
   }
   if (images.length === 0 || images.length > 5) {
     return { error: 'Please add between 1 and 5 images' };
@@ -518,10 +525,13 @@ app.post('/bookings', verifyToken, verifyRole('customer'), async (req, res) => {
   if (eventDate < today) {
     return res.status(400).send({ message: 'The event date can not be in the past' });
   }
-  if (!eventLocation?.trim()) {
+  if (typeof eventLocation !== 'string' || !eventLocation.trim()) {
     return res.status(400).send({ message: 'Please add the event location' });
   }
-  if (message && message.length > 500) {
+  if (eventLocation.length > 200) {
+    return res.status(400).send({ message: 'The event location can be up to 200 characters' });
+  }
+  if (message && (typeof message !== 'string' || message.length > 500)) {
     return res.status(400).send({ message: 'The message can be up to 500 characters' });
   }
 
