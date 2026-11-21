@@ -436,6 +436,13 @@ app.delete('/services/:id', verifyToken, verifyRole('vendor', 'admin'), async (r
   }
 
   await servicesCollection.deleteOne({ _id: service._id });
+
+  // Requests still waiting for this service can't be answered any more
+  await bookingsCollection.updateMany(
+    { serviceId: service._id, status: 'pending' },
+    { $set: { status: 'cancelled' } },
+  );
+
   res.send({ message: 'Service deleted' });
 });
 
