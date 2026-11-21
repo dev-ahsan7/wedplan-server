@@ -2,8 +2,8 @@
 
 Express and MongoDB API for **WedPlan**, a wedding planning platform where couples find wedding services and send booking requests, vendors publish and manage their services, and admins keep the platform clean.
 
-- **Live API:** _add after deploying_
-- **Live website:** _add after deploying_
+- **Live API:** https://wedplan-server-plum.vercel.app
+- **Live website:** https://wedplan-red-nine.vercel.app
 - **Client repository:** [dev-ahsan7/WedPlan](https://github.com/dev-ahsan7/WedPlan)
 - **Server repository:** [dev-ahsan7/wedplan-server](https://github.com/dev-ahsan7/wedplan-server)
 
