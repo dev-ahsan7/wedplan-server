@@ -4,6 +4,7 @@ import 'dotenv/config';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { MongoClient, ObjectId } from 'mongodb';
 import Stripe from 'stripe';
+import { attachDatabasePool } from '@vercel/functions';
 
 const app = express();
 const PORT = process.env.PORT || 8100;
@@ -17,6 +18,9 @@ const PREMIUM_CURRENCY = 'usd';
 
 const client = new MongoClient(process.env.MONGODB_URI);
 const db = client.db('wedPlan');
+
+// On Vercel this closes idle connections before the function sleeps
+attachDatabasePool(client);
 
 // Better Auth keeps users in the "user" collection
 const usersCollection = db.collection('user');
