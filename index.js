@@ -909,6 +909,16 @@ app.use((req, res) => {
 });
 
 app.use((error, req, res, next) => {
+  // Broken JSON in the request body
+  if (error.type === 'entity.parse.failed') {
+    return res.status(400).send({ message: 'The request body is not valid JSON' });
+  }
+  // Stripe could not be reached or refused the request
+  if (error.type?.startsWith('Stripe')) {
+    console.error('Stripe error:', error.message);
+    return res.status(502).send({ message: 'Payment service is not available, please try again' });
+  }
+
   console.error(error);
   res.status(500).send({ message: 'Something went wrong on the server' });
 });
