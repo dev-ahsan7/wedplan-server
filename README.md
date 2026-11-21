@@ -83,6 +83,13 @@ Node.js, Express 5, MongoDB (official driver), jose, Stripe, dotenv, cors.
    stripe listen --forward-to localhost:8100/webhooks/stripe
    ```
 
+## Deploy on Vercel
+
+1. Import this repository as a Vercel project. `vercel.json` sends every request to `index.js`.
+2. Add the environment variables from the table above, with `CLIENT_URL` set to the live client address.
+3. Also add `NODEJS_HELPERS=0`. It stops Vercel from reading the request body first, so the Stripe webhook can check its signature on the raw body.
+4. In the Stripe dashboard, add a webhook endpoint at `<server URL>/webhooks/stripe` for the events `checkout.session.completed`, `checkout.session.expired`, `customer.subscription.updated` and `customer.subscription.deleted`, and use its signing secret as `STRIPE_WEBHOOK_SECRET`.
+
 ## Scripts
 
 - `npm run make-admin -- someone@example.com` gives an existing account the admin role. Admins can't sign up from the website.
