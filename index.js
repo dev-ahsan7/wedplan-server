@@ -70,9 +70,14 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
     );
   }
 
-  // Monthly renewal: move the end date forward
+  // Monthly renewal: move the end date forward.
+  // Also keeps the "cancelled" flag right if the vendor cancels in Stripe.
   if (event.type === 'customer.subscription.updated') {
     const subscription = event.data.object;
+    await transactionsCollection.updateOne(
+      { stripeSubscriptionId: subscription.id },
+      { $set: { cancelAtPeriodEnd: subscription.cancel_at_period_end } },
+    );
     if (subscription.status === 'active') {
       await usersCollection.updateOne(
         { _id: new ObjectId(subscription.metadata.vendorId) },
@@ -823,6 +828,48 @@ app.get('/subscriptions/session/:sessionId', verifyToken, verifyRole('vendor'), 
     plan: req.user.subscriptionPlan,
     subscriptionExpiresAt: req.user.subscriptionExpiresAt,
   });
+});
+
+// The vendor's plan for the Subscription page
+app.get('/subscriptions/me', verifyToken, verifyRole('vendor'), async (req, res) => {
+  const latestPaid = await transactionsCollection.findOne(
+    { vendorId: new ObjectId(req.user.id), status: 'paid' },
+    { sort: { createdAt: -1 } },
+  );
+
+  res.send({
+    plan: req.user.subscriptionPlan,
+    subscriptionExpiresAt: req.user.subscriptionExpiresAt,
+    cancelAtPeriodEnd: Boolean(latestPaid?.cancelAtPeriodEnd),
+  });
+});
+
+// Cancels Premium at the end of the paid month, so the vendor keeps what they paid for
+app.post('/subscriptions/cancel', verifyToken, verifyRole('vendor'), async (req, res) => {
+  if (req.user.subscriptionPlan !== 'premium') {
+    return res.status(400).send({ message: 'You are not on the Premium plan' });
+  }
+
+  const latestPaid = await transactionsCollection.findOne(
+    { vendorId: new ObjectId(req.user.id), status: 'paid' },
+    { sort: { createdAt: -1 } },
+  );
+  if (!latestPaid?.stripeSubscriptionId) {
+    return res.status(404).send({ message: 'Subscription not found' });
+  }
+  if (latestPaid.cancelAtPeriodEnd) {
+    return res.status(400).send({ message: 'Your subscription is already cancelled' });
+  }
+
+  await stripe.subscriptions.update(latestPaid.stripeSubscriptionId, {
+    cancel_at_period_end: true,
+  });
+  await transactionsCollection.updateOne(
+    { _id: latestPaid._id },
+    { $set: { cancelAtPeriodEnd: true } },
+  );
+
+  res.send({ message: 'Premium will end at the end of your billing month' });
 });
 
 // The logged in user, as the server sees them
